@@ -1,0 +1,302 @@
+#! /usr/bin/env nix-shell
+#! nix-shell -i python3 -p python3
+
+import argparse
+from contextlib import contextmanager
+import os
+import shutil
+import sys
+import tomllib
+import uuid
+from collections.abc import Callable, Iterator
+from pathlib import Path
+
+
+class UniswError(Exception):
+    pass
+
+
+Undo = Callable[[], None]
+
+
+@contextmanager
+def transaction(operation: str) -> Iterator[Callable[[Undo, Undo], None]]:
+    """Compose filesystem steps and undo them in reverse order on failure."""
+    undo_stack: list[Undo] = []
+
+    def step(action: Undo, undo: Undo) -> None:
+        action()
+        undo_stack.append(undo)
+
+    try:
+        yield step
+    except OSError as error:
+        for undo in reversed(undo_stack):
+            try:
+                undo()
+            except OSError:
+                pass
+        raise UniswError(f"{operation} failed and was rolled back: {error}") from error
+
+
+def xdg_home(name: str, default: Path) -> Path:
+    value = os.environ.get(name)
+    path = Path(value).expanduser() if value else default
+    return path if path.is_absolute() else default
+
+
+def config_path() -> Path:
+    return xdg_home("XDG_CONFIG_HOME", Path.home() / ".config") / "unisw" / "config.toml"
+
+
+def vault_root() -> Path:
+    return xdg_home("XDG_DATA_HOME", Path.home() / ".local" / "share") / "unisw" / "vault"
+
+
+def validate_component(value: str, kind: str) -> str:
+    if not value or value in {".", ".."} or Path(value).name != value:
+        raise UniswError(f"Invalid {kind} {value!r}; it must be one path component.")
+    return value
+
+
+def profile_dir(app: str, profile: str) -> Path:
+    return vault_root() / validate_component(app, "app name") / validate_component(profile, "profile name")
+
+
+def path_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def load_config() -> dict:
+    path = config_path()
+    if not path.is_file():
+        raise UniswError(f"Config file not found: {path}\nCreate it manually; unisw never modifies config.")
+    with path.open("rb") as file:
+        return tomllib.load(file)
+
+
+def app_paths(config: dict, app: str) -> list[Path]:
+    validate_component(app, "app name")
+    section = config.get(app)
+    values = section.get("paths") if isinstance(section, dict) else None
+    if not isinstance(values, list) or not values:
+        raise UniswError(f"App {app!r} must define a non-empty paths array.")
+    paths = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise UniswError("Every configured path must be a non-empty string.")
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            raise UniswError(f"Configured path must be absolute: {value!r}")
+        path = Path(os.path.abspath(path))
+        if any(path == other or path in other.parents or other in path.parents for other in paths):
+            raise UniswError(f"Configured paths overlap: {path}")
+        paths.append(path)
+    return paths
+
+
+def managed_link(path: Path) -> bool:
+    if not path.is_symlink():
+        return False
+    try:
+        target = path.resolve(strict=True)
+    except OSError:
+        return False
+    return target.is_dir() and target.parent.parent.parent == vault_root().resolve(strict=False)
+
+
+def raw_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise UniswError(f"Refusing unexpected symlink at {path}.")
+    if path_exists(path) and not path.is_dir():
+        raise UniswError(f"Configured target must be a directory: {path}")
+
+
+def validate_new_target(path: Path) -> bool:
+    """Validate one new-login target and return whether it contains raw data."""
+    if path.is_symlink():
+        if not managed_link(path):
+            raise UniswError(f"Refusing unexpected symlink at {path}.")
+        return False
+    raw_directory(path)
+    return path.exists()
+
+
+def clear_target(path: Path) -> None:
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def confirm_delete(paths: list[Path]) -> bool:
+    if not paths:
+        return True
+    prompt = "Delete raw unsaved data at " + ", ".join(map(str, paths)) + "? [y/N]: "
+    return input(prompt).lower() == "y"
+
+
+def stage_target(path: Path, slot: Path, step: Callable[[Undo, Undo], None]) -> None:
+    if not path.exists():
+        step(slot.mkdir, slot.rmdir)
+        return
+    # rename() moves the directory entry; symlinks inside it are not traversed.
+    step(
+        lambda: path.rename(slot),
+        lambda: slot.rename(path),
+    )
+
+
+def replace_link(path: Path, target: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.unisw-{uuid.uuid4().hex}")
+    try:
+        temporary.symlink_to(target, target_is_directory=True)
+        temporary.replace(path)
+    finally:
+        if temporary.is_symlink():
+            temporary.unlink()
+
+
+def execute_new(app: str, config: dict) -> None:
+    paths = app_paths(config, app)
+    raw = [path for path in paths if validate_new_target(path)]
+    if not confirm_delete(raw):
+        raise UniswError("Aborted. Snatch the data first to preserve it.")
+    for path in paths:
+        clear_target(path)
+    print(f"Ready for a fresh {app!r} login.")
+
+
+def execute_snatch(app: str, profile: str, config: dict) -> None:
+    paths, vault = app_paths(config, app), profile_dir(app, profile)
+    if path_exists(vault):
+        raise UniswError(f"Profile {profile!r} already exists; refusing to overwrite it.")
+    for path in paths:
+        raw_directory(path)
+
+    with transaction("Snatch") as step:
+        step(lambda: vault.mkdir(parents=True), vault.rmdir)
+        for index, path in enumerate(paths):
+            stage_target(path, vault / f"path_{index}", step)
+        for index, path in enumerate(paths):
+            slot = vault / f"path_{index}"
+            step(
+                lambda path=path, slot=slot: replace_link(path, slot),
+                lambda path=path: path.unlink() if path.is_symlink() else None,
+            )
+    print(f"Successfully snatched {app!r} into {profile!r}.")
+
+
+def execute_switch(app: str, profile: str, config: dict) -> None:
+    paths, vault = app_paths(config, app), profile_dir(app, profile)
+    slots = [vault / f"path_{index}" for index in range(len(paths))]
+    if not vault.is_dir() or vault.is_symlink() or any(not slot.is_dir() or slot.is_symlink() for slot in slots):
+        raise UniswError(f"Profile {profile!r} is missing, incomplete, or unsafe.")
+    for path in paths:
+        if path.is_symlink() and not managed_link(path):
+            raise UniswError(f"Refusing unexpected symlink at {path}.")
+        if not path.is_symlink() and path.exists():
+            raise UniswError(f"{path} contains unsaved data; snatch it before switching.")
+
+    with transaction("Switch") as step:
+        for path, slot in zip(paths, slots):
+            old = path.readlink() if path.is_symlink() else None
+
+            def restore(path=path, old=old):
+                if old is None:
+                    if path.is_symlink():
+                        path.unlink()
+                else:
+                    replace_link(path, old)
+
+            step(lambda: replace_link(path, slot), restore)
+    print(f"Successfully switched {app!r} to {profile!r}.")
+
+
+def profile_names(directory: Path) -> list[str]:
+    if not directory.is_dir() or directory.is_symlink():
+        return []
+    return sorted(
+        path.name for path in directory.iterdir()
+        if path.is_dir() and not path.is_symlink()
+    )
+
+
+def execute_ls(app: str | None) -> None:
+    if app is not None:
+        validate_component(app, "app name")
+    root = vault_root()
+    if not root.is_dir():
+        print("No profiles found.")
+        return
+    app_dirs = [root / app] if app else sorted(
+        path for path in root.iterdir() if path.is_dir() and not path.is_symlink()
+    )
+    listings = [(directory.name, profile_names(directory)) for directory in app_dirs]
+    listings = [(app_name, profiles) for app_name, profiles in listings if profiles]
+    for app_name, profiles in listings:
+        print(f"\n[{app_name}]\n" + "\n".join(f"  - {profile}" for profile in profiles))
+    if not listings:
+        print("No profiles found.")
+
+
+def execute_mv(app: str, old: str, new: str, config: dict) -> None:
+    paths, source, destination = app_paths(config, app), profile_dir(app, old), profile_dir(app, new)
+    if not source.is_dir() or source.is_symlink():
+        raise UniswError(f"Profile {old!r} does not exist in {app!r}.")
+    if path_exists(destination):
+        raise UniswError(f"Profile {new!r} already exists in {app!r}.")
+    active = source.resolve()
+    for path in paths:
+        if path.is_symlink():
+            try:
+                if path.resolve(strict=True).is_relative_to(active):
+                    raise UniswError(f"Profile {old!r} is active; switch away before renaming.")
+            except FileNotFoundError:
+                pass
+    source.rename(destination)
+    print(f"Successfully renamed {old!r} to {new!r}.")
+
+
+def add_command(commands, name: str, help_text: str, *arguments: str) -> None:
+    parser = commands.add_parser(name, help=help_text)
+    for argument in arguments:
+        options = {"nargs": "?"} if name == "ls" else {}
+        parser.add_argument(argument, **options)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Universal Account Switcher")
+    commands = parser.add_subparsers(dest="command", metavar="COMMAND")
+    add_command(commands, "new", "Clear paths for a fresh login", "app")
+    add_command(commands, "snatch", "Snapshot current state", "app", "profile")
+    add_command(commands, "switch", "Switch to a profile", "app", "profile")
+    add_command(commands, "mv", "Rename a profile", "app", "old", "new")
+    add_command(commands, "ls", "List profiles", "app")
+
+    args = parser.parse_args()
+    if args.command is None:
+        parser.print_help()
+        return
+    try:
+        if args.command == "ls":
+            execute_ls(args.app)
+            return
+        config = load_config()
+        if args.command == "new":
+            execute_new(args.app, config)
+        elif args.command == "snatch":
+            execute_snatch(args.app, args.profile, config)
+        elif args.command == "switch":
+            execute_switch(args.app, args.profile, config)
+        else:
+            execute_mv(args.app, args.old, args.new, config)
+    except (EOFError, OSError, tomllib.TOMLDecodeError, UniswError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+
+
+if __name__ == "__main__":
+    main()
