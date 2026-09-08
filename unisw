@@ -2,9 +2,12 @@
 #! nix-shell -i python3 -p python3
 
 import argparse
+from argparse import Namespace
 from contextlib import contextmanager
+import errno
 import os
 import shutil
+import stat
 import sys
 import tomllib
 import uuid
@@ -16,7 +19,7 @@ class UniswError(Exception):
     pass
 
 
-Undo = Callable[[], None]
+type Undo = Callable[[], None]
 
 
 @contextmanager
@@ -30,13 +33,32 @@ def transaction(operation: str) -> Iterator[Callable[[Undo, Undo], None]]:
 
     try:
         yield step
-    except OSError as error:
+    except BaseException as error:
+        rollback_errors = []
         for undo in reversed(undo_stack):
             try:
                 undo()
-            except OSError:
-                pass
-        raise UniswError(f"{operation} failed and was rolled back: {error}") from error
+            except Exception as e:
+                rollback_errors.append(e)
+
+        # PEP 654: Group multiple errors if the rollback itself fails
+        if rollback_errors:
+            # PEP 654: Use BaseExceptionGroup if the primary error is not a standard Exception
+            group_cls = (
+                BaseExceptionGroup
+                if not isinstance(error, Exception)
+                else ExceptionGroup
+            )
+            raise group_cls(
+                f"{operation} failed and rollback encountered issues",
+                [error, *rollback_errors],
+            )
+
+        if isinstance(error, OSError):
+            raise UniswError(
+                f"{operation} failed and was rolled back: {error}"
+            ) from error
+        raise
 
 
 def xdg_home(name: str, default: Path) -> Path:
@@ -46,11 +68,15 @@ def xdg_home(name: str, default: Path) -> Path:
 
 
 def config_path() -> Path:
-    return xdg_home("XDG_CONFIG_HOME", Path.home() / ".config") / "unisw" / "config.toml"
+    return (
+        xdg_home("XDG_CONFIG_HOME", Path.home() / ".config") / "unisw" / "config.toml"
+    )
 
 
 def vault_root() -> Path:
-    return xdg_home("XDG_DATA_HOME", Path.home() / ".local" / "share") / "unisw" / "vault"
+    return (
+        xdg_home("XDG_DATA_HOME", Path.home() / ".local" / "share") / "unisw" / "vault"
+    )
 
 
 def validate_component(value: str, kind: str) -> str:
@@ -60,7 +86,11 @@ def validate_component(value: str, kind: str) -> str:
 
 
 def profile_dir(app: str, profile: str) -> Path:
-    return vault_root() / validate_component(app, "app name") / validate_component(profile, "profile name")
+    return (
+        vault_root()
+        / validate_component(app, "app name")
+        / validate_component(profile, "profile name")
+    )
 
 
 def path_exists(path: Path) -> bool:
@@ -70,7 +100,9 @@ def path_exists(path: Path) -> bool:
 def load_config() -> dict:
     path = config_path()
     if not path.is_file():
-        raise UniswError(f"Config file not found: {path}\nCreate it manually; unisw never modifies config.")
+        raise UniswError(
+            f"Config file not found: {path}\nCreate it manually; unisw never modifies config."
+        )
     with path.open("rb") as file:
         return tomllib.load(file)
 
@@ -88,8 +120,12 @@ def app_paths(config: dict, app: str) -> list[Path]:
         path = Path(value).expanduser()
         if not path.is_absolute():
             raise UniswError(f"Configured path must be absolute: {value!r}")
-        path = Path(os.path.abspath(path))
-        if any(path == other or path in other.parents or other in path.parents for other in paths):
+        # Pure pathlib, resolves '.' and '..' based on CWD
+        path = path.absolute()
+        if any(
+            path == other or path in other.parents or other in path.parents
+            for other in paths
+        ):
             raise UniswError(f"Configured paths overlap: {path}")
         paths.append(path)
     return paths
@@ -102,7 +138,9 @@ def managed_link(path: Path) -> bool:
         target = path.resolve(strict=True)
     except OSError:
         return False
-    return target.is_dir() and target.parent.parent.parent == vault_root().resolve(strict=False)
+
+    # Much safer than checking exact parent depth
+    return target.is_dir() and target.is_relative_to(vault_root().resolve(strict=False))
 
 
 def raw_directory(path: Path) -> None:
@@ -122,18 +160,26 @@ def validate_new_target(path: Path) -> bool:
     return path.exists()
 
 
+def remove_readonly(
+    func: Callable[[str], None], path: str, _exc: BaseException
+) -> None:
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
 def clear_target(path: Path) -> None:
     if path.is_symlink():
         path.unlink()
     elif path.exists():
-        shutil.rmtree(path)
+        # Python 3.12+ standard; no fallback needed for modern environments
+        shutil.rmtree(path, onexc=remove_readonly)
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def confirm_delete(paths: list[Path]) -> bool:
     if not paths:
         return True
-    prompt = "Delete raw unsaved data at " + ", ".join(map(str, paths)) + "? [y/N]: "
+    prompt = f"Delete raw unsaved data at {', '.join(map(str, paths))}? [y/N]: "
     return input(prompt).lower() == "y"
 
 
@@ -141,11 +187,20 @@ def stage_target(path: Path, slot: Path, step: Callable[[Undo, Undo], None]) -> 
     if not path.exists():
         step(slot.mkdir, slot.rmdir)
         return
+
+    def do_move():
+        try:
+            path.rename(slot)
+        except OSError as e:
+            if e.errno == errno.EXDEV:
+                raise UniswError(
+                    f"Cannot snatch {path}: it is on a different filesystem than the vault. "
+                    "Atomic switching requires both to be on the same drive."
+                ) from e
+            raise
+
     # rename() moves the directory entry; symlinks inside it are not traversed.
-    step(
-        lambda: path.rename(slot),
-        lambda: slot.rename(path),
-    )
+    step(do_move, lambda: slot.rename(path))
 
 
 def replace_link(path: Path, target: Path) -> None:
@@ -172,7 +227,9 @@ def execute_new(app: str, config: dict) -> None:
 def execute_snatch(app: str, profile: str, config: dict) -> None:
     paths, vault = app_paths(config, app), profile_dir(app, profile)
     if path_exists(vault):
-        raise UniswError(f"Profile {profile!r} already exists; refusing to overwrite it.")
+        raise UniswError(
+            f"Profile {profile!r} already exists; refusing to overwrite it."
+        )
     for path in paths:
         raw_directory(path)
 
@@ -192,13 +249,19 @@ def execute_snatch(app: str, profile: str, config: dict) -> None:
 def execute_switch(app: str, profile: str, config: dict) -> None:
     paths, vault = app_paths(config, app), profile_dir(app, profile)
     slots = [vault / f"path_{index}" for index in range(len(paths))]
-    if not vault.is_dir() or vault.is_symlink() or any(not slot.is_dir() or slot.is_symlink() for slot in slots):
+    if (
+        not vault.is_dir()
+        or vault.is_symlink()
+        or any(not slot.is_dir() or slot.is_symlink() for slot in slots)
+    ):
         raise UniswError(f"Profile {profile!r} is missing, incomplete, or unsafe.")
     for path in paths:
         if path.is_symlink() and not managed_link(path):
             raise UniswError(f"Refusing unexpected symlink at {path}.")
         if not path.is_symlink() and path.exists():
-            raise UniswError(f"{path} contains unsaved data; snatch it before switching.")
+            raise UniswError(
+                f"{path} contains unsaved data; snatch it before switching."
+            )
 
     with transaction("Switch") as step:
         for path, slot in zip(paths, slots):
@@ -219,7 +282,8 @@ def profile_names(directory: Path) -> list[str]:
     if not directory.is_dir() or directory.is_symlink():
         return []
     return sorted(
-        path.name for path in directory.iterdir()
+        path.name
+        for path in directory.iterdir()
         if path.is_dir() and not path.is_symlink()
     )
 
@@ -231,8 +295,12 @@ def execute_ls(app: str | None) -> None:
     if not root.is_dir():
         print("No profiles found.")
         return
-    app_dirs = [root / app] if app else sorted(
-        path for path in root.iterdir() if path.is_dir() and not path.is_symlink()
+    app_dirs = (
+        [root / app]
+        if app
+        else sorted(
+            path for path in root.iterdir() if path.is_dir() and not path.is_symlink()
+        )
     )
     listings = [(directory.name, profile_names(directory)) for directory in app_dirs]
     listings = [(app_name, profiles) for app_name, profiles in listings if profiles]
@@ -243,7 +311,11 @@ def execute_ls(app: str | None) -> None:
 
 
 def execute_mv(app: str, old: str, new: str, config: dict) -> None:
-    paths, source, destination = app_paths(config, app), profile_dir(app, old), profile_dir(app, new)
+    paths, source, destination = (
+        app_paths(config, app),
+        profile_dir(app, old),
+        profile_dir(app, new),
+    )
     if not source.is_dir() or source.is_symlink():
         raise UniswError(f"Profile {old!r} does not exist in {app!r}.")
     if path_exists(destination):
@@ -253,7 +325,9 @@ def execute_mv(app: str, old: str, new: str, config: dict) -> None:
         if path.is_symlink():
             try:
                 if path.resolve(strict=True).is_relative_to(active):
-                    raise UniswError(f"Profile {old!r} is active; switch away before renaming.")
+                    raise UniswError(
+                        f"Profile {old!r} is active; switch away before renaming."
+                    )
             except FileNotFoundError:
                 pass
     source.rename(destination)
@@ -267,6 +341,14 @@ def add_command(commands, name: str, help_text: str, *arguments: str) -> None:
         parser.add_argument(argument, **options)
 
 
+class CLIArgs(Namespace):
+    command: str | None
+    app: str | None
+    profile: str | None
+    old: str | None
+    new: str | None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Universal Account Switcher")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -276,7 +358,7 @@ def main() -> None:
     add_command(commands, "mv", "Rename a profile", "app", "old", "new")
     add_command(commands, "ls", "List profiles", "app")
 
-    args = parser.parse_args()
+    args = parser.parse_args(namespace=CLIArgs())
     if args.command is None:
         parser.print_help()
         return
@@ -293,9 +375,11 @@ def main() -> None:
             execute_switch(args.app, args.profile, config)
         else:
             execute_mv(args.app, args.old, args.new, config)
-    except (EOFError, OSError, tomllib.TOMLDecodeError, UniswError) as error:
-        print(f"Error: {error}", file=sys.stderr)
-        raise SystemExit(1) from error
+    # PEP 654: except* natively unpacks ExceptionGroups while still catching single exceptions
+    except* (EOFError, OSError, tomllib.TOMLDecodeError, UniswError) as error_group:
+        for err in error_group.exceptions:
+            print(f"Error: {err}", file=sys.stderr)
+        raise SystemExit(1) from error_group
 
 
 if __name__ == "__main__":
