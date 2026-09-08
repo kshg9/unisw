@@ -1,7 +1,11 @@
+import errno
 import importlib.util
+import io
 import os
+import stat
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
@@ -24,10 +28,13 @@ class UniswTests(unittest.TestCase):
         self.state = self.root / "state"
         self.paths = [self.state / "first", self.state / "second"]
         self.config = {"chatgpt": {"paths": [str(path) for path in self.paths]}}
-        self.environment = patch.dict(os.environ, {
-            "XDG_CONFIG_HOME": str(self.config_home),
-            "XDG_DATA_HOME": str(self.data_home),
-        })
+        self.environment = patch.dict(
+            os.environ,
+            {
+                "XDG_CONFIG_HOME": str(self.config_home),
+                "XDG_DATA_HOME": str(self.data_home),
+            },
+        )
         self.environment.start()
 
     def tearDown(self):
@@ -46,7 +53,9 @@ class UniswTests(unittest.TestCase):
         for path in self.paths:
             self.assertTrue(path.is_symlink())
         self.assertEqual(
-            (unisw.profile_dir("chatgpt", "work") / "path_0" / "account.txt").read_text(),
+            (
+                unisw.profile_dir("chatgpt", "work") / "path_0" / "account.txt"
+            ).read_text(),
             "one",
         )
 
@@ -99,6 +108,80 @@ class UniswTests(unittest.TestCase):
         with self.assertRaises(unisw.UniswError):
             unisw.load_config()
         self.assertFalse((self.config_home / "unisw" / "config.toml").exists())
+
+    def test_snatch_exdev_triggers_rollback(self):
+        """Proves the transaction undo-stack works if a mid-operation move fails."""
+        self.make_state()
+        original_rename = Path.rename
+
+        # Force the first path's rename to fail with EXDEV
+        def failing_rename(self_path, target_path):
+            if self_path == self.paths[0]:
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return original_rename(self_path, target_path)
+
+        with patch.object(Path, "rename", failing_rename):
+            with self.assertRaisesRegex(unisw.UniswError, "different filesystem"):
+                unisw.execute_snatch("chatgpt", "work", self.config)
+
+        # CRITICAL: The vault should have been created and then rolled back (deleted)
+        self.assertFalse(unisw.profile_dir("chatgpt", "work").exists())
+        # The original data should still be intact
+        self.assertTrue(self.paths[0].is_dir())
+
+    def test_new_clears_readonly_files(self):
+        """Proves the shutil.rmtree onexc handler correctly strips read-only bits."""
+        self.make_state()
+
+        # Create a stubborn read-only file inside the target directory
+        readonly_file = self.paths[0] / "locked.txt"
+        readonly_file.write_text("secret")
+        os.chmod(readonly_file, stat.S_IREAD)
+
+        # Mock the user confirming the deletion
+        with patch("builtins.input", return_value="y"):
+            unisw.execute_new("chatgpt", self.config)
+
+        self.assertFalse(self.paths[0].exists())
+
+    def test_config_rejects_overlapping_paths(self):
+        """Proves app_paths catches nested/overlapping directories."""
+        # First path is the parent of the second path
+        bad_config = {"chatgpt": {"paths": [str(self.state), str(self.paths[0])]}}
+
+        with self.assertRaisesRegex(unisw.UniswError, "overlap"):
+            unisw.app_paths(bad_config, "chatgpt")
+
+    def test_new_aborts_on_rejection(self):
+        """Proves that declining the confirmation prompt leaves data untouched."""
+        self.make_state()
+
+        with patch("builtins.input", return_value="n"):
+            with self.assertRaisesRegex(unisw.UniswError, "Aborted"):
+                unisw.execute_new("chatgpt", self.config)
+
+        # Data must still be exactly as it was
+        self.assertEqual((self.paths[0] / "account.txt").read_text(), "one")
+
+    def test_ls_lists_profiles(self):
+        """Basic coverage for the execute_ls command."""
+        self.make_state()
+        unisw.execute_snatch("chatgpt", "work", self.config)
+
+        # Defensive mock: execute_new MIGHT prompt if the state is raw data
+        with patch("builtins.input", return_value="y"):
+            unisw.execute_new("chatgpt", self.config)
+
+        self.make_state("p1", "p2")
+        unisw.execute_snatch("chatgpt", "personal", self.config)
+
+        f = io.StringIO()
+        with redirect_stdout(f):
+            unisw.execute_ls("chatgpt")
+
+        output = f.getvalue()
+        self.assertIn("work", output)
+        self.assertIn("personal", output)
 
 
 if __name__ == "__main__":
