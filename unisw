@@ -20,10 +20,11 @@ class UniswError(Exception):
 
 
 type Undo = Callable[[], None]
+type Step = Callable[[Undo, Undo], None]
 
 
 @contextmanager
-def transaction(operation: str) -> Iterator[Callable[[Undo, Undo], None]]:
+def transaction(operation: str) -> Iterator[Step]:
     """Compose filesystem steps and undo them in reverse order on failure."""
     undo_stack: list[Undo] = []
 
@@ -34,25 +35,11 @@ def transaction(operation: str) -> Iterator[Callable[[Undo, Undo], None]]:
     try:
         yield step
     except BaseException as error:
-        rollback_errors = []
         for undo in reversed(undo_stack):
             try:
                 undo()
             except Exception as e:
-                rollback_errors.append(e)
-
-        # PEP 654: Group multiple errors if the rollback itself fails
-        if rollback_errors:
-            # PEP 654: Use BaseExceptionGroup if the primary error is not a standard Exception
-            group_cls = (
-                BaseExceptionGroup
-                if not isinstance(error, Exception)
-                else ExceptionGroup
-            )
-            raise group_cls(
-                f"{operation} failed and rollback encountered issues",
-                [error, *rollback_errors],
-            )
+                print(f"warning: rollback step failed: {e}", file=sys.stderr)
 
         if isinstance(error, OSError):
             raise UniswError(
@@ -120,27 +107,26 @@ def app_paths(config: dict, app: str) -> list[Path]:
         path = Path(value).expanduser()
         if not path.is_absolute():
             raise UniswError(f"Configured path must be absolute: {value!r}")
-        # Pure pathlib, resolves '.' and '..' based on CWD
-        path = path.absolute()
+        path = Path(os.path.normpath(path))
         if any(
-            path == other or path in other.parents or other in path.parents
-            for other in paths
+            path.is_relative_to(other) or other.is_relative_to(path) for other in paths
         ):
             raise UniswError(f"Configured paths overlap: {path}")
         paths.append(path)
     return paths
 
 
-def managed_link(path: Path) -> bool:
+def managed_target(path: Path) -> Path | None:
+    """Resolved vault path if `path` is a symlink we manage, else None."""
     if not path.is_symlink():
-        return False
+        return None
     try:
         target = path.resolve(strict=True)
     except OSError:
-        return False
-
-    # Much safer than checking exact parent depth
-    return target.is_dir() and target.is_relative_to(vault_root().resolve(strict=False))
+        return None
+    if target.is_dir() and target.is_relative_to(vault_root().resolve(strict=False)):
+        return target
+    return None
 
 
 def raw_directory(path: Path) -> None:
@@ -153,7 +139,7 @@ def raw_directory(path: Path) -> None:
 def validate_new_target(path: Path) -> bool:
     """Validate one new-login target and return whether it contains raw data."""
     if path.is_symlink():
-        if not managed_link(path):
+        if managed_target(path) is None:
             raise UniswError(f"Refusing unexpected symlink at {path}.")
         return False
     raw_directory(path)
@@ -171,7 +157,6 @@ def clear_target(path: Path) -> None:
     if path.is_symlink():
         path.unlink()
     elif path.exists():
-        # Python 3.12+ standard; no fallback needed for modern environments
         shutil.rmtree(path, onexc=remove_readonly)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -183,7 +168,7 @@ def confirm_delete(paths: list[Path]) -> bool:
     return input(prompt).lower() == "y"
 
 
-def stage_target(path: Path, slot: Path, step: Callable[[Undo, Undo], None]) -> None:
+def stage_target(path: Path, slot: Path, step: Step) -> None:
     if not path.exists():
         step(slot.mkdir, slot.rmdir)
         return
@@ -236,12 +221,11 @@ def execute_snatch(app: str, profile: str, config: dict) -> None:
     with transaction("Snatch") as step:
         step(lambda: vault.mkdir(parents=True), vault.rmdir)
         for index, path in enumerate(paths):
-            stage_target(path, vault / f"path_{index}", step)
-        for index, path in enumerate(paths):
             slot = vault / f"path_{index}"
+            stage_target(path, slot, step)
             step(
-                lambda path=path, slot=slot: replace_link(path, slot),
-                lambda path=path: path.unlink() if path.is_symlink() else None,
+                lambda p=path, s=slot: replace_link(p, s),
+                lambda p=path: p.unlink() if p.is_symlink() else None,
             )
     print(f"Successfully snatched {app!r} into {profile!r}.")
 
@@ -249,14 +233,18 @@ def execute_snatch(app: str, profile: str, config: dict) -> None:
 def execute_switch(app: str, profile: str, config: dict) -> None:
     paths, vault = app_paths(config, app), profile_dir(app, profile)
     slots = [vault / f"path_{index}" for index in range(len(paths))]
-    if (
-        not vault.is_dir()
-        or vault.is_symlink()
-        or any(not slot.is_dir() or slot.is_symlink() for slot in slots)
-    ):
-        raise UniswError(f"Profile {profile!r} is missing, incomplete, or unsafe.")
+    if not vault.is_dir() or vault.is_symlink():
+        raise UniswError(f"Profile {profile!r} is missing or unsafe.")
+    if any(not slot.is_dir() or slot.is_symlink() for slot in slots):
+        raise UniswError(f"Profile {profile!r} is incomplete or unsafe.")
+    expected = {slot.name for slot in slots}
+    if (actual := {p.name for p in vault.iterdir()}) != expected:
+        raise UniswError(
+            f"Profile {profile!r} doesn't match the current config: "
+            f"unexpected {sorted(actual - expected)}, missing {sorted(expected - actual)}"
+        )
     for path in paths:
-        if path.is_symlink() and not managed_link(path):
+        if path.is_symlink() and managed_target(path) is None:
             raise UniswError(f"Refusing unexpected symlink at {path}.")
         if not path.is_symlink() and path.exists():
             raise UniswError(
@@ -267,14 +255,13 @@ def execute_switch(app: str, profile: str, config: dict) -> None:
         for path, slot in zip(paths, slots):
             old = path.readlink() if path.is_symlink() else None
 
-            def restore(path=path, old=old):
-                if old is None:
-                    if path.is_symlink():
-                        path.unlink()
-                else:
-                    replace_link(path, old)
+            def restore(p=path, o=old):
+                if p.is_symlink():
+                    p.unlink()
+                if o is not None:
+                    replace_link(p, o)
 
-            step(lambda: replace_link(path, slot), restore)
+            step(lambda p=path, s=slot: replace_link(p, s), restore)
     print(f"Successfully switched {app!r} to {profile!r}.")
 
 
@@ -288,6 +275,19 @@ def profile_names(directory: Path) -> list[str]:
     )
 
 
+def active_profile(app: str, config: dict) -> str | None:
+    """Determine which profile is currently active for an app."""
+    try:
+        paths = app_paths(config, app)
+    except UniswError:
+        return None
+
+    for path in paths:
+        if (target := managed_target(path)) is not None:
+            return target.parent.name
+    return None
+
+
 def execute_ls(app: str | None) -> None:
     if app is not None:
         validate_component(app, "app name")
@@ -295,6 +295,13 @@ def execute_ls(app: str | None) -> None:
     if not root.is_dir():
         print("No profiles found.")
         return
+
+    # Load config to determine active profiles
+    try:
+        config = load_config()
+    except UniswError:
+        config = {}
+
     app_dirs = (
         [root / app]
         if app
@@ -302,11 +309,20 @@ def execute_ls(app: str | None) -> None:
             path for path in root.iterdir() if path.is_dir() and not path.is_symlink()
         )
     )
-    listings = [(directory.name, profile_names(directory)) for directory in app_dirs]
-    listings = [(app_name, profiles) for app_name, profiles in listings if profiles]
-    for app_name, profiles in listings:
-        print(f"\n[{app_name}]\n" + "\n".join(f"  - {profile}" for profile in profiles))
-    if not listings:
+
+    found = False
+    for directory in app_dirs:
+        profiles = profile_names(directory)
+        if not profiles:
+            continue
+        found = True
+        active = active_profile(directory.name, config)
+        print(f"\n[{directory.name}]")
+        for profile in profiles:
+            marker = " [active]" if profile == active else ""
+            print(f"  - {profile}{marker}")
+
+    if not found:
         print("No profiles found.")
 
 
@@ -322,64 +338,59 @@ def execute_mv(app: str, old: str, new: str, config: dict) -> None:
         raise UniswError(f"Profile {new!r} already exists in {app!r}.")
     active = source.resolve()
     for path in paths:
-        if path.is_symlink():
-            try:
-                if path.resolve(strict=True).is_relative_to(active):
-                    raise UniswError(
-                        f"Profile {old!r} is active; switch away before renaming."
-                    )
-            except FileNotFoundError:
-                pass
+        if (target := managed_target(path)) and target.is_relative_to(active):
+            raise UniswError(f"Profile {old!r} is active; switch away before renaming.")
     source.rename(destination)
     print(f"Successfully renamed {old!r} to {new!r}.")
 
 
-def add_command(commands, name: str, help_text: str, *arguments: str) -> None:
-    parser = commands.add_parser(name, help=help_text)
-    for argument in arguments:
-        options = {"nargs": "?"} if name == "ls" else {}
-        parser.add_argument(argument, **options)
-
-
 class CLIArgs(Namespace):
-    command: str | None
+    command: str
     app: str | None
     profile: str | None
     old: str | None
     new: str | None
+    handler: Callable[["CLIArgs"], None]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Universal Account Switcher")
-    commands = parser.add_subparsers(dest="command", metavar="COMMAND")
-    add_command(commands, "new", "Clear paths for a fresh login", "app")
-    add_command(commands, "snatch", "Snapshot current state", "app", "profile")
-    add_command(commands, "switch", "Switch to a profile", "app", "profile")
-    add_command(commands, "mv", "Rename a profile", "app", "old", "new")
-    add_command(commands, "ls", "List profiles", "app")
+    commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
+
+    sub = commands.add_parser("new", help="Clear paths for a fresh login")
+    sub.add_argument("app")
+    sub.set_defaults(handler=lambda a: execute_new(a.app, load_config()))
+
+    sub = commands.add_parser("snatch", help="Snapshot current state")
+    sub.add_argument("app")
+    sub.add_argument("profile")
+    sub.set_defaults(handler=lambda a: execute_snatch(a.app, a.profile, load_config()))
+
+    sub = commands.add_parser("switch", help="Switch to a profile")
+    sub.add_argument("app")
+    sub.add_argument("profile")
+    sub.set_defaults(handler=lambda a: execute_switch(a.app, a.profile, load_config()))
+
+    sub = commands.add_parser("mv", help="Rename a profile")
+    sub.add_argument("app")
+    sub.add_argument("old")
+    sub.add_argument("new")
+    sub.set_defaults(handler=lambda a: execute_mv(a.app, a.old, a.new, load_config()))
+
+    sub = commands.add_parser("ls", help="List profiles")
+    sub.add_argument("app", nargs="?")
+    sub.set_defaults(handler=lambda a: execute_ls(a.app))
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        raise SystemExit(2)
 
     args = parser.parse_args(namespace=CLIArgs())
-    if args.command is None:
-        parser.print_help()
-        return
     try:
-        if args.command == "ls":
-            execute_ls(args.app)
-            return
-        config = load_config()
-        if args.command == "new":
-            execute_new(args.app, config)
-        elif args.command == "snatch":
-            execute_snatch(args.app, args.profile, config)
-        elif args.command == "switch":
-            execute_switch(args.app, args.profile, config)
-        else:
-            execute_mv(args.app, args.old, args.new, config)
-    # PEP 654: except* natively unpacks ExceptionGroups while still catching single exceptions
-    except* (EOFError, OSError, tomllib.TOMLDecodeError, UniswError) as error_group:
-        for err in error_group.exceptions:
-            print(f"Error: {err}", file=sys.stderr)
-        raise SystemExit(1) from error_group
+        args.handler(args)
+    except (EOFError, OSError, tomllib.TOMLDecodeError, UniswError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1) from e
 
 
 if __name__ == "__main__":
